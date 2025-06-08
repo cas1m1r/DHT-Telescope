@@ -33,7 +33,7 @@ pip install -r requirements.txt
 python crawler.py
 ```
 
-:compass: Use Cases:
+# :compass: Use Cases:
 * :gear: Network protocol research
 * :earth_africa: Decentralized system mapping
 * :closed_lock_with_key: Surveillance infrastructure awareness
@@ -44,7 +44,7 @@ python crawler.py
 # :brain: Philosophy
 DHT-Telescope is not just a tool—it’s an invitation to see the unseen physics of decentralized communication. Each peer is a pixel. Each packet, a pulse. And together, they form a living map of how knowledge, files, and identity drift through the dark spaces between servers.
 
-# :scales: Ethics & Intent
+# :anchor: Ethics & Intent
 This project is for educational, analytical, and research purposes only. It does not store or share content or torrent payloads—only metadata on observable node behaviors. Use responsibly and with consent when visualizing non-public infrastructure.
 
 
