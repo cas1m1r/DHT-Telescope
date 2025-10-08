@@ -32,6 +32,21 @@ cd dht-telescope
 pip install -r requirements.txt
 python crawler.py
 ```
+*Note: for plotting download MAXMIND databases to the dht-telescope folder:*
+```
+├─ run.bat
+├─ resolver.py
+├─ crawler.py 
+├───GeoLite2-ASN_20250527
+├───GeoLite2-City_20250523
+└───GeoLite2-Country_20250523
+```
+And (if on windows) you can build the visual by running `run.bat` and then view the html file that is generated (will auto update itself). 
+
+Will make a script for unix based systems but for now you can run:
+```
+python resolver.py summary --plot live --plot-output bt_map_opacity_live.html --geo-cache geo_cache.json --half-life-min 15 --cutoff-hours 6 --refresh-sec 10
+```
 
 # :compass: Use Cases:
 * :gear: Network protocol research
@@ -50,4 +65,3 @@ This project is for educational, analytical, and research purposes only. It does
 
 # :dna: Attribution
 Created by cas1m1r, 2025
-Part of a suite of introspective tools including CuriosityEngine and Recursive Allegory Processor.
