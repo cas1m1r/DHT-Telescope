@@ -31,8 +31,10 @@ except Exception:
 BOOTSTRAP_NODES = [
     ("router.bittorrent.com", 6881),
     ("router.utorrent.com", 6881),
-    ("dht.transmissionbt.com", 6881),
     ("dht.aelitis.com", 6881),
+    ("dht.anacrolix.link", 42069),
+    ("dht.transmissionbt.com", 6881),
+    ("dht.libtorrent.org", 25401),
 ]
 
 # ---------------- Tunables ----------------
@@ -754,7 +756,7 @@ def main():
                     elif y == b"r": handle_response(msg, addr)
 
         # 2) Mode switch
-        if not listen_mode and (found >= args.depth or len(nodes) >= args.depth or (time.time() - t0) > 180):
+        if not listen_mode and (found >= args.depth or len(nodes) >= args.depth or (time.time() - t0) > 18000):
             listen_mode = True
             print(f"[{int(time.time()-t0)}s] Switching to HARVEST (listen/serve+explore). "
                   f"found={found} known_nodes={len(nodes)} in_flight={in_flight}")

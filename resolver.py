@@ -326,13 +326,15 @@ def cmd_top(con: sqlite3.Connection, limit: int):
                           ("first","first_seen"),("last","last_seen")],limit)
     print()
     hashes = [row['info_hash'] for row in rows]
-    for h in hashes:
+    random.shuffle(hashes)
+    for h in list(set(hashes)):
         try:
             info = get_metadata_from_infohash(h,15)
             print(f'{h} -> {info["name"]}')
             upsert_metadata(con, h, info['name'], info)
         except TimeoutError:
             print(f'Cannot resolve {h}')
+
         
     
 def cmd_files(con: sqlite3.Connection, ih: str):
@@ -585,6 +587,10 @@ def get_pending_announces(con: sqlite3.Connection, limit: int, since_minutes: Op
         """,(limit,)).fetchall()
     return rows
 
+
+
+
+
 async def resolve_one(con: sqlite3.Connection, row: sqlite3.Row, timeout: float, per_ih: int, dht_peers: int) -> bool:
     id_, ip, port, ih = row["id"], row["ip"], int(row["port"]), row["info_hash"]
     mark_announce(con, id_, "working")
@@ -624,7 +630,7 @@ async def resolver_loop(db_path: str, batch: int, concurrency: int, timeout: flo
     sem = asyncio.Semaphore(max(1, concurrency))
     while True:
         con = open_db(db_path)
-        rows = get_pending_announces(con, batch, since_minutes)
+        rows = get_pending_announces(con, batch, int(time.time()) )
         if not rows:
             con.close()
             if not loop_forever:
@@ -635,7 +641,7 @@ async def resolver_loop(db_path: str, batch: int, concurrency: int, timeout: flo
             async with sem:
                 con2 = open_db(db_path)
                 try:
-                    # await resolve_one(con2, r, timeout, per_ih, dht_peers)
+                    await resolve_one(con2, r, timeout, per_ih, dht_peers)
                     id_, ip, port, ih = r["id"], r["ip"], int(r["port"]), r["info_hash"]
                     print(f'Trying to resolve {ih[:16]}')
                     mark_announce(con, id_, "working")
@@ -679,6 +685,7 @@ def _collect_ips_from_db(db_path: str, since_hours: int = 72) -> set:
     except Exception: pass
     con.close()
     return ips
+
 
 def build_geo_cache_if_needed(db_path, cache_path="geo_cache.json", city_mmdb=None, asn_mmdb=None, since_hours=2):
     p = Path(cache_path)
@@ -745,6 +752,7 @@ def build_geo_cache_if_needed(db_path, cache_path="geo_cache.json", city_mmdb=No
     except Exception: pass
     print(f"[plot] geo_cache.json built with {filled:,} entries")
 
+
 def _load_activity(db_path: str):
     out = {}
     con = sqlite3.connect(db_path); con.row_factory = sqlite3.Row
@@ -767,8 +775,10 @@ def _load_activity(db_path: str):
     con.close()
     return out
 
+
 def _hash_color(token: str) -> str:
     return "#" + hashlib.md5((token or "x").encode()).hexdigest()[:6]
+
 
 def _nice_age(sec):
     if sec is None: return "never"
@@ -777,6 +787,7 @@ def _nice_age(sec):
     if sec < 86400: return f"{int(sec//3600)}h"
     return f"{int(sec//86400)}d"
 
+
 def _ensure_folium():
     try:
         import folium
@@ -784,6 +795,7 @@ def _ensure_folium():
         return folium
     except Exception as e:
         raise RuntimeError("folium not installed (pip install folium)") from e
+
 
 def _write_map_refresh(html_path: Path, refresh_sec: int):
     allow_write(html_path)
@@ -973,9 +985,11 @@ def main():
 
     sp = sub.add_parser("metadata", help="List resolved metadata")
     sp.add_argument("--query", help="Filter by name or info_hash substring")
-
-    sub.add_parser("top", help="Top infohashes by get_peers count")
-
+    
+    sp_top = sub.add_parser("top", help="Top infohashes by get_peers count")
+    sp_top.add_argument("--loop", action="store_true", help="refresh in a loop until ctrl+c")
+    sp_top.add_argument("--interval", type=int, default=30, help="seconds between refreshes")
+    
     fp = sub.add_parser("files", help="Show file list for a torrent")
     fp.add_argument("--ih", required=True)
 
@@ -989,7 +1003,7 @@ def main():
     rp.add_argument("--timeout", type=float, default=8.0, help="Per-peer timeout (s)")
     rp.add_argument("--per-ih", type=int, default=8, help="Max peers tried per infohash (after announce)")
     rp.add_argument("--dht-peers", type=int, default=30, help="Peers to fetch via DHT get_peers")
-    rp.add_argument("--since-minutes", type=int, default=120*60, help="Only resolve announces newer than this many minutes")
+    rp.add_argument("--since-minutes", type=int, default=120, help="Only resolve announces newer than this many minutes")
     rp.add_argument("--loop", action="store_true", help="Keep resolving as new announces arrive")
 
     args = ap.parse_args()
@@ -1040,7 +1054,15 @@ def main():
     elif args.cmd == "metadata":
         cmd_metadata(con, args.limit, getattr(args, "query", None))
     elif args.cmd == "top":
-        cmd_top(con, args.limit)
+        try:
+            while True:
+                os.system("cls" if os.name == "nt" else "clear")
+                cmd_top(con, args.limit)
+                if not getattr(args, "loop", False):
+                    break
+                time.sleep(int(getattr(args, "interval", 30)))
+        except KeyboardInterrupt:
+            pass
     elif args.cmd == "files":
         cmd_files(con, args.ih)
     elif args.cmd == "export":
