@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
-# db_resolver_view.py — inspect & resolve metadata from dht_observatory.db
-# Adds a robust, DHT-assisted resolver that runs OUT-OF-PROCESS from your harvester.
+# resolver.py — inspect & resolve metadata from dht_observatory.db
+# Safe-by-design: only BEP-9 metadata exchange (no payload), with optional write-cage.
+
 import argparse, json, time, sqlite3, hashlib
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
-import argparse, sqlite3, json, time, os, sys, socket, struct, hashlib, asyncio, random
-from typing import List, Tuple, Any, Optional, Dict
+from typing import Dict, Any, Tuple, Optional, List
+import os, sys, socket, struct, asyncio, random, math, builtins
 
+# ---- try to import your snippet-based lookup ----
+_GETMETA = None
+# try:
+#     # your helper that worked in the REPL screenshot
+#     from dht_crawler_v4 import get_metadata_from_infohash as _GETMETA
+# except Exception:
+#     _GETMETA = None
+
+from dht_crawler_v4 import get_metadata_from_infohash
+
+# -------------------- CONFIG --------------------
 DEFAULT_DB = "dht_observatory.db"
 METADATA_PIECE_LEN = 16384
 BT_PSTR = b"BitTorrent protocol"
-RESERVED = bytearray(b"\x00"*8); RESERVED[5] |= 0x10; RESERVED = bytes(RESERVED)
-RESERVED = bytes(RESERVED)
+RESERVED = bytearray(b"\x00"*8); RESERVED[5] |= 0x10; RESERVED = bytes(RESERVED)  # extension bit
 MSG_EXTENDED = 20
 EXT_HANDSHAKE_ID = 0
-DEFAULT_CITY_DB = os.environ.get("GEOIP2_CITY_DB",
-                                 os.path.join(os.getcwd(), "GeoLite2-City_20250523", "GeoLite2-City.mmdb"))
-DEFAULT_ASN_DB  = os.environ.get("GEOIP2_ASN_DB",
-                                 os.path.join(os.getcwd(), "GeoLite2-ASN_20250527", "GeoLite2-ASN.mmdb"))
+
+# DHT routers (UDP)
 ROUTERS = [
     ("router.bittorrent.com", 6881),
     ("router.utorrent.com", 6881),
@@ -25,16 +33,34 @@ ROUTERS = [
     ("dht.aelitis.com", 6881),
 ]
 
-# ---------------- small utils ----------------
+# Optional write cage (prevent accidental file downloads / writes)
+WRITE_GUARD_ENABLED = os.environ.get("RESOLVER_WRITE_GUARD", "1") not in ("0", "false", "False", "")
+_WRITE_WHITELIST: set = set()
+_REAL_OPEN = builtins.open
 
+def allow_write(p: Path):
+    try:
+        _WRITE_WHITELIST.add(p.resolve())
+    except Exception:
+        pass
+
+def guarded_open(file, mode='r', *a, **kw):
+    if WRITE_GUARD_ENABLED and any(x in mode for x in ('w','a','x','+')):
+        p = Path(file).resolve()
+        if p not in _WRITE_WHITELIST:
+            raise RuntimeError(f"[write-cage] refusing write to {p}")
+    return _REAL_OPEN(file, mode, *a, **kw)
+
+if WRITE_GUARD_ENABLED:
+    builtins.open = guarded_open
+
+# -------------------- UTIL --------------------
 def human_bytes(n: Optional[int]) -> str:
-    if n is None:
-        return "—"
+    if n is None: return "—"
     units = ["B","KB","MB","GB","TB","PB","EB"]
     f = float(n)
     for u in units:
-        if f < 1024.0:
-            return f"{f:.1f}{u}"
+        if f < 1024.0: return f"{f:.1f}{u}"
         f /= 1024.0
     return f"{f:.1f}ZB"
 
@@ -46,21 +72,9 @@ def ago(ts: Optional[int]) -> str:
     if d < 86400: return f"{d//3600}h ago"
     return f"{d//86400}d ago"
 
-def open_db(path: str) -> sqlite3.Connection:
-    if not os.path.exists(path):
-        print(f"[!] DB not found: {path}", file=sys.stderr)
-        sys.exit(2)
-    con = sqlite3.connect(path, timeout=30, isolation_level=None)
-    con.row_factory = sqlite3.Row
-    # tolerate slight schema differences
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
-    return con
-
 def print_table(rows: List[dict], cols: List[Tuple[str,str]], limit: int):
     if not rows:
-        print("(no rows)")
-        return
+        print("(no rows)"); return
     rows = rows[:limit]
     widths = {h: len(h) for _, h in cols}
     for r in rows:
@@ -68,13 +82,30 @@ def print_table(rows: List[dict], cols: List[Tuple[str,str]], limit: int):
             s = str(r.get(key,""))
             widths[hdr] = max(widths[hdr], len(s))
     line = "  ".join(hdr.ljust(widths[hdr]) for _, hdr in cols)
-    print(line)
-    print("-" * len(line))
+    print(line); print("-" * len(line))
     for r in rows:
         print("  ".join(str(r.get(key,"")).ljust(widths[hdr]) for key, hdr in cols))
 
-# ---------------- tiny bencode ----------------
+def sample_filenames(files_json: Optional[str], maxn: int = 5) -> Tuple[int, str]:
+    try:
+        files = json.loads(files_json or "[]")
+    except Exception:
+        files = []
+    if not files:
+        return (0, "")
+    names = [f.get("path","") for f in files if isinstance(f, dict)]
+    return (len(names), ", ".join(names[:maxn]))
 
+def open_db(path: str) -> sqlite3.Connection:
+    if not os.path.exists(path):
+        print(f"[!] DB not found: {path}", file=sys.stderr); sys.exit(2)
+    con = sqlite3.connect(path, timeout=30, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    return con
+
+# -------------------- BENCODE --------------------
 def benc_enc(x) -> bytes:
     if isinstance(x, int): return b"i%de" % x
     if isinstance(x, (bytes, bytearray)):
@@ -84,7 +115,6 @@ def benc_enc(x) -> bytes:
     if isinstance(x, list): return b"l"+b"".join(benc_enc(i) for i in x)+b"e"
     if isinstance(x, dict):
         items=[]
-        # sort by raw bytes of the key
         for k in sorted(x.keys(), key=lambda k: k if isinstance(k,(bytes,bytearray)) else str(k).encode()):
             kb = k if isinstance(k,(bytes,bytearray)) else str(k).encode()
             items.append(benc_enc(kb)+benc_enc(x[k]))
@@ -106,8 +136,7 @@ def _bdec_any(b: bytes, i: int):
         while b[i:i+1] != b"e":
             k,i=_bdec_any(b,i)
             if not isinstance(k,(bytes,bytearray)): raise ValueError("dict key must be bytes")
-            v,i=_bdec_any(b,i)
-            out[k]=v
+            v,i=_bdec_any(b,i); out[k]=v
         return out, i+1
     if 48 <= b[i] <= 57:
         j = b.index(b":", i); ln=int(b[i:j]); s=j+1; e=s+ln
@@ -120,9 +149,8 @@ def benc_dec(buf: bytes):
     if idx != len(buf): raise ValueError("trailing")
     return obj
 
-# --------------- DB views (unchanged) ---------------
-
-def cmd_summary(con: sqlite3.Connection, limit: int):
+# -------------------- DB VIEWS --------------------
+def cmd_summary(con: sqlite3.Connection, limit: int, do_lookup: bool, name_timeout: float, cache_names: bool):
     print("# Summary")
     a_total = con.execute("SELECT COUNT(*) AS c FROM announces").fetchone()["c"]
     by_status = con.execute("SELECT status, COUNT(*) c FROM announces GROUP BY status").fetchall()
@@ -136,35 +164,129 @@ def cmd_summary(con: sqlite3.Connection, limit: int):
     print(f"metadata:  {md_total}\n")
 
     print("## Recent announces")
+    # Pull recent announces and any existing metadata name in one go
     rows = con.execute("""
-        SELECT ts, ip, port, info_hash, status, attempts
-        FROM announces
-        ORDER BY ts DESC LIMIT ?;
+        SELECT a.ts, a.ip, a.port, a.info_hash, a.status, a.attempts,
+               m.name AS mname, m.total_length AS msize
+        FROM announces a
+        LEFT JOIN metadata m ON m.info_hash = a.info_hash
+        ORDER BY a.ts DESC LIMIT ?;
     """,(limit,)).fetchall()
-    rows_fmt = [{"when":ago(r["ts"]),"peer":f"{r['ip']}:{r['port']}",
-                 "info_hash":r["info_hash"],"status":r["status"],"tries":r["attempts"]} for r in rows]
-    print_table(rows_fmt,[("when","when"),("peer","peer"),("info_hash","info_hash"),
-                          ("status","status"),("tries","tries")],limit)
+
+    rows_fmt = []
+    for r in rows:
+        name = r["mname"] or ""
+        # Best-effort lookup only when missing, and only if helper is available
+        if do_lookup and not name and _GETMETA:
+            try:
+                info = _GETMETA(r["info_hash"], int(max(1, name_timeout)))
+                if isinstance(info, dict):
+                    name = (info.get('name') or "") if 'name' in info else (info.get('info',{}).get('name') or "")
+                    # optionally cache into metadata
+                    if cache_names and name:
+                        try:
+                            upsert_metadata(con, r["info_hash"], _coerce_info_to_bdict(info))
+                        except Exception:
+                            pass
+            except Exception:
+                pass  # timeout / no metadata
+
+        rows_fmt.append({
+            "when": ago(r["ts"]),
+            "peer": f"{r['ip']}:{r['port']}",
+            "info_hash": r["info_hash"],
+            "name": name or "",
+            "status": r["status"],
+            "tries": r["attempts"],
+        })
+
+    print_table(
+        rows_fmt,
+        [("when","when"),("peer","peer"),("info_hash","info_hash"),
+         ("name","name"),("status","status"),("tries","tries")],
+        33
+    )
     print()
 
-    print("## Recent get_peers")
-    rows = con.execute("""
-        SELECT ts, ip, port, info_hash
-        FROM getpeers
-        ORDER BY ts DESC LIMIT ?;
-    """,(limit,)).fetchall()
-    rows_fmt = [{"when":ago(r["ts"]),"peer":f"{r['ip']}:{r['port']}",
-                 "info_hash":r["info_hash"]} for r in rows]
-    print_table(rows_fmt,[("when","when"),("peer","peer"),("info_hash","info_hash")],limit)
+    # Show most recently resolved metadata with filenames
+    print("## Recent resolved (with filenames)")
+    mrows = con.execute("""
+        SELECT info_hash, name, total_length, files_json, last_resolved_ts
+        FROM metadata
+        ORDER BY last_resolved_ts DESC
+        LIMIT ?;
+    """,(min(10, limit),)).fetchall()
+    mfmt = []
+    for r in mrows:
+        count, sample = sample_filenames(r["files_json"], maxn=5)
+        mfmt.append({
+            "when": ago(r["last_resolved_ts"]),
+            "info_hash": r["info_hash"],
+            "name": r["name"] or "(unnamed)",
+            "size": human_bytes(r["total_length"]),
+            "files": f"{count}" if count else "1",
+            "sample": sample if sample else "(single-file torrent)"
+        })
+    print_table(
+        mfmt,
+        [("when","when"),("info_hash","info_hash"),("name","name"),("files","#files")],
+        limit=min(10, limit)
+    )
     print()
+
+    # print("## Recent get_peers")
+    # rows = con.execute("""
+    #     SELECT ts, ip, port, info_hash
+    #     FROM getpeers
+    #     ORDER BY ts DESC LIMIT ?;
+    # """,(limit,)).fetchall()
+    # rows_fmt = [{"when":ago(r["ts"]),"peer":f"{r['ip']}:{r['port']}",
+    #              "info_hash":r["info_hash"]} for r in rows]
+    # print_table(rows_fmt,[("when","when"),("peer","peer"),("info_hash","info_hash")],limit)
+    # print()
+
+# Helper to coerce your snippet-return dict into the bdict shape expected by upsert_metadata
+def _coerce_info_to_bdict(info: Dict[str, Any]) -> Dict[bytes, Any]:
+    # Accepts dicts like {'name': 'X', 'size': N, 'path': '...', 'total': N} etc.
+    # Produces a minimal BEP-3 info bdict-ish structure used by upsert_metadata.
+    out: Dict[bytes, Any] = {}
+    name = info.get("name")
+    if name: out[b"name"] = name.encode(errors="replace")
+    total = None
+    if "total" in info and isinstance(info["total"], int):
+        total = info["total"]
+    elif "size" in info and isinstance(info["size"], int):
+        total = info["size"]
+    if total is not None:
+        out[b"length"] = int(total)
+    # files list if present (optional)
+    files = info.get("files") or []
+    if isinstance(files, list) and files:
+        fl = []
+        for f in files:
+            try:
+                ln = int(f.get("size") or f.get("length") or 0)
+                p = f.get("path") or ""
+                parts = [p.encode(errors="replace")] if isinstance(p, str) else []
+                fl.append({b"length": ln, b"path": parts})
+            except Exception:
+                continue
+        if fl:
+            out[b"files"] = fl
+            out.pop(b"length", None)
+    # defaults so upsert_metadata doesn’t crash
+    out.setdefault(b"piece length", 0)
+    out.setdefault(b"private", 0)
+    return out
 
 def cmd_unresolved(con: sqlite3.Connection, limit: int):
-    print("# Unresolved announces (pending or error, no metadata yet)")
+    print("# Unresolved announces (pending/error/working; no metadata yet)")
     rows = con.execute("""
         SELECT a.id, a.ts, a.ip, a.port, a.info_hash, a.status, a.attempts
         FROM announces a
         LEFT JOIN metadata m ON m.info_hash=a.info_hash
-        WHERE m.info_hash IS NULL AND (a.status='pending' OR a.status='error' OR a.status='working')
+        WHERE m.info_hash IS NULL
+          AND (a.status='pending' OR a.status='error' OR a.status='working')
         ORDER BY a.ts DESC
         LIMIT ?;
     """,(limit,)).fetchall()
@@ -203,21 +325,32 @@ def cmd_top(con: sqlite3.Connection, limit: int):
     print_table(rows_fmt,[("hits","hits"),("info_hash","info_hash"),
                           ("first","first_seen"),("last","last_seen")],limit)
     print()
-
+    hashes = [row['info_hash'] for row in rows]
+    for h in hashes:
+        try:
+            info = get_metadata_from_infohash(h,15)
+            print(f'{h} -> {info["name"]}')
+            upsert_metadata(con, h, info['name'], info)
+        except TimeoutError:
+            print(f'Cannot resolve {h}')
+        
+    
 def cmd_files(con: sqlite3.Connection, ih: str):
     print(f"# Files in torrent {ih}")
     r = con.execute("SELECT name, files_json, total_length, piece_length, private FROM metadata WHERE info_hash=?",(ih,)).fetchone()
     if not r:
-        print("(no metadata)"); return
+        r = get_metadata_from_infohash(ih, 30)
+        
     print(f"name: {r['name'] or '(unnamed)'}")
-    print(f"size: {human_bytes(r['total_length'])}  piece_length: {human_bytes(r['piece_length'])}  private: {r['private']}")
+    # print(f"size: {human_bytes(r['total_length'])}  piece_length: {human_bytes(r['piece_length'])}  private: {r['private']}")
     files=[]
     try:
         files=json.loads(r["files_json"] or "[]")
     except Exception:
         pass
     if not files:
-        print("(no file list)"); return
+        print("(no file list)");
+        return
     w_size=max(len("size"), max((len(human_bytes(f.get("length",0))) for f in files), default=4))
     w_path=max(len("path"), max((len(f.get("path","")) for f in files), default=4))
     print("size".ljust(w_size),"  ","path")
@@ -226,6 +359,8 @@ def cmd_files(con: sqlite3.Connection, ih: str):
         print(human_bytes(f.get("length",0)).ljust(w_size),"  ",f.get("path",""))
 
 def cmd_export(con: sqlite3.Connection, what: str, out: str, limit: int):
+    outp = Path(out)
+    allow_write(outp)  # whitelist this explicit export file
     if what=="metadata":
         rows = con.execute("""
             SELECT info_hash, name, total_length, piece_length, private, files_json, first_seen_ts, last_resolved_ts
@@ -243,15 +378,12 @@ def cmd_export(con: sqlite3.Connection, what: str, out: str, limit: int):
         """,(limit,)).fetchall()
     else:
         print(f"[!] unknown export: {what}"); return
-    with open(out,"w",encoding="utf-8") as f:
+    with open(outp,"w",encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(dict(r), ensure_ascii=False)+"\n")
-    print(f"[+] wrote {len(rows)} rows to {out}")
+    print(f"[+] wrote {len(rows)} rows to {outp}")
 
-# --------------- outbound-only resolver ---------------
-
-def sha1(b: bytes) -> bytes: return hashlib.sha1(b).digest()
-
+# -------------------- METADATA-ONLY RESOLVER --------------------
 def compact_nodes_to_list(compact: bytes):
     out=[]
     for i in range(0,len(compact),26):
@@ -264,7 +396,6 @@ def compact_nodes_to_list(compact: bytes):
     return out
 
 async def dht_get_peers(info_hash: bytes, want=30, timeout=2.0) -> List[Tuple[str,int]]:
-    """Tiny UDP DHT walk (outbound only) to gather a few peers for ih."""
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False); sock.settimeout(timeout)
@@ -307,8 +438,7 @@ async def dht_get_peers(info_hash: bytes, want=30, timeout=2.0) -> List[Tuple[st
     except Exception: pass
     return list(peers)[:want]
 
-def bt_handshake_and_ut_metadata(ip: str, port: int, ih_hex: str, timeout: float) -> Optional[Dict[str,Any]]:
-    """Plain TCP BitTorrent handshake + ut_metadata; returns parsed 'info' dict on success."""
+def bt_handshake_and_ut_metadata(ip: str, port: int, ih_hex: str, timeout: float) -> Optional[Dict[bytes,Any]]:
     ih = bytes.fromhex(ih_hex)
     peer_id = b"-DBRV01-"+os.urandom(12)
 
@@ -323,20 +453,17 @@ def bt_handshake_and_ut_metadata(ip: str, port: int, ih_hex: str, timeout: float
 
     with socket.create_connection((ip,int(port)), timeout=timeout) as s:
         s.settimeout(timeout)
-        # handshake
         hs = bytes([len(BT_PSTR)])+BT_PSTR+RESERVED+ih+peer_id
         send(s, hs)
         resp = recv_all(s, 68)
         if len(resp)!=68 or resp[0]!=len(BT_PSTR) or resp[1:20]!=BT_PSTR:
             return None
-        if not (resp[20+5] & 0x10):   # extension not supported
+        if not (resp[20+5] & 0x10):
             return None
 
-        # ext handshake
         ext = benc_enc({b"m": {b"ut_metadata": 1}})
         send(s, struct.pack("!I", 2+len(ext)) + bytes([MSG_EXTENDED, 0]) + ext)
 
-        # helper
         def read_msg():
             hdr = recv_all(s, 4); (ln,) = struct.unpack("!I", hdr)
             if ln==0: return None, b""
@@ -367,14 +494,12 @@ def bt_handshake_and_ut_metadata(ip: str, port: int, ih_hex: str, timeout: float
             while time.time()<t_end:
                 mid,payload = read_msg()
                 if mid!=MSG_EXTENDED or payload[0]!=ut_id: continue
-                # header dict + piece bytes
                 header, idx = _bdec_any(payload[1:], 0)
                 if not isinstance(header, dict): continue
                 msg_type = int(header.get(b"msg_type",-1))
                 piece_idx = int(header.get(b"piece",-1))
                 if msg_type==1 and piece_idx==i:
-                    enc = benc_enc(header)
-                    off = 1 + len(enc)
+                    enc = benc_enc(header); off = 1 + len(enc)
                     return header.get(b"total_size"), payload[off:]
                 if msg_type==2:
                     return None, None
@@ -404,8 +529,7 @@ def bt_handshake_and_ut_metadata(ip: str, port: int, ih_hex: str, timeout: float
             return None
         return info
 
-def upsert_metadata(con: sqlite3.Connection, ih_hex: str, info: Dict[bytes,Any]):
-    name = (info.get(b"name") or b"").decode(errors="replace")
+def upsert_metadata(con: sqlite3.Connection, ih_hex: str, name,info: Dict[bytes,Any]):
     piece_len = int(info.get(b"piece length") or 0)
     private = int(info.get(b"private") or 0)
     total_len = 0
@@ -442,7 +566,7 @@ def mark_announce(con: sqlite3.Connection, id_: int, status: str):
 
 def get_pending_announces(con: sqlite3.Connection, limit: int, since_minutes: Optional[int]) -> List[sqlite3.Row]:
     if since_minutes and since_minutes > 0:
-        after = int(time.time()) - since_minutes*60
+        after = (int(time.time()) - since_minutes)*60
         rows = con.execute("""
             SELECT a.id, a.ts, a.ip, a.port, a.info_hash
             FROM announces a
@@ -462,49 +586,41 @@ def get_pending_announces(con: sqlite3.Connection, limit: int, since_minutes: Op
     return rows
 
 async def resolve_one(con: sqlite3.Connection, row: sqlite3.Row, timeout: float, per_ih: int, dht_peers: int) -> bool:
-    """
-    Try: (1) the announcing peer; (2) DHT-walk peers (up to per_ih).
-    Returns True if resolved and inserted.
-    """
     id_, ip, port, ih = row["id"], row["ip"], int(row["port"]), row["info_hash"]
-
-    # 1) try announce peer quickly
     mark_announce(con, id_, "working")
-    try:
-        info = bt_handshake_and_ut_metadata(ip, port, ih, timeout)
-        if info:
-            upsert_metadata(con, ih, info)
-            mark_announce(con, id_, "ok")
-            print(f"[OK] {ih[:16]}..  via {ip}:{port}")
-            return True
-    except Exception:
-        pass  # fall through
+    # info = bt_handshake_and_ut_metadata(ip, port, ih, timeout)
+    info = get_metadata_from_infohash(ih, timeout)
+    if info:
+        upsert_metadata(con, ih, info['name'],info)
+        mark_announce(con, id_, "ok")
+        print(f"[OK] {ih[:16]}..  via {ip}:{port}->{info['name']}")
+        return True
 
-    # 2) fallback via DHT to find more peers and try a few
-    try:
-        peers = await dht_get_peers(bytes.fromhex(ih), want=dht_peers, timeout=max(2.0, timeout/2))
-    except Exception:
-        peers = []
-    tried = 0
-    for pip, pport in peers:
-        if tried >= per_ih:
-            break
-        tried += 1
-        try:
-            info = bt_handshake_and_ut_metadata(pip, pport, ih, timeout)
-            if info:
-                upsert_metadata(con, ih, info)
-                mark_announce(con, id_, "ok")
-                print(f"[OK] {ih[:16]}..  via {pip}:{pport} (DHT)")
-                return True
-        except Exception:
-            continue
-
+    # try:
+    #     peers = await dht_get_peers(bytes.fromhex(ih), want=dht_peers, timeout=max(2.0, timeout/2))
+    # except Exception:
+    #     peers = []
+    # tried = 0
+    # for pip, pport in peers:
+    #     if tried >= per_ih: break
+    #     tried += 1
+    #     try:
+    #         info = bt_handshake_and_ut_metadata(pip, pport, ih, timeout)
+    #         if info:
+    #             upsert_metadata(con, ih, info)
+    #             mark_announce(con, id_, "ok")
+    #             print(f"[OK] {ih[:16]}..  via {pip}:{pport} (DHT)")
+    #             return True
+    #     except Exception:
+    #         continue
     mark_announce(con, id_, "error")
-    print(f"[FAIL] {ih[:16]}..  announce {ip}:{port} + DHT({tried}/{dht_peers})")
+    print(f"[FAIL] {ih[:16]}..  announce {ip}:{port} ")
     return False
 
-async def resolver_loop(db_path: str, batch: int, concurrency: int, timeout: float, per_ih: int, dht_peers: int, since_minutes: Optional[int], loop_forever: bool):
+async def resolver_loop(db_path: str, batch: int, concurrency: int, timeout: float,
+                        per_ih: int, dht_peers: int, since_minutes: Optional[int], loop_forever: bool):
+    if since_minutes is None:
+        since_minutes = 60
     sem = asyncio.Semaphore(max(1, concurrency))
     while True:
         con = open_db(db_path)
@@ -513,26 +629,40 @@ async def resolver_loop(db_path: str, batch: int, concurrency: int, timeout: flo
             con.close()
             if not loop_forever:
                 print("[i] nothing to resolve."); return
-            await asyncio.sleep(10)
-            continue
+            await asyncio.sleep(10); continue
 
         async def run_one(r: sqlite3.Row):
             async with sem:
                 con2 = open_db(db_path)
                 try:
-                    await resolve_one(con2, r, timeout, per_ih, dht_peers)
+                    # await resolve_one(con2, r, timeout, per_ih, dht_peers)
+                    id_, ip, port, ih = r["id"], r["ip"], int(r["port"]), r["info_hash"]
+                    print(f'Trying to resolve {ih[:16]}')
+                    mark_announce(con, id_, "working")
+                    try:
+                        info = bt_handshake_and_ut_metadata(ip, port, ih, timeout)
+                        print(f"[OK] {ih[:16]}..  via {ip}:{port}->{info['name']}")
+                    except:
+                        info = get_metadata_from_infohash(ih, timeout)
+                        print(f"[OK] {ih[:16]}..  via {ip}:{port}->{info['name']}")
+                        pass
+                    
+                    if info:
+                        upsert_metadata(con, ih, info['name'])
+                        mark_announce(con, id_, "ok")
+                        
+                    else:
+                        print(f'[FAIL] Unable to resolve {ih[:16]}')
                 finally:
                     con2.close()
 
         tasks = [asyncio.create_task(run_one(r)) for r in rows]
         await asyncio.gather(*tasks, return_exceptions=True)
         con.close()
-        if not loop_forever:
-            return
+        if not loop_forever: return
         await asyncio.sleep(2)
 
-
-# --------------- plotting + geo cache (used only when --plot is passed) ---------------
+# -------------------- PLOTTING / GEO (optional) --------------------
 def _collect_ips_from_db(db_path: str, since_hours: int = 72) -> set:
     con = sqlite3.connect(db_path); con.row_factory = sqlite3.Row
     now = int(time.time()); since = now - since_hours*3600 if since_hours else None
@@ -550,41 +680,38 @@ def _collect_ips_from_db(db_path: str, since_hours: int = 72) -> set:
     con.close()
     return ips
 
-def build_geo_cache_if_needed(db_path, cache_path="geo_cache.json", city_mmdb=DEFAULT_CITY_DB, asn_mmdb=DEFAULT_ASN_DB, since_hours=2):
+def build_geo_cache_if_needed(db_path, cache_path="geo_cache.json", city_mmdb=None, asn_mmdb=None, since_hours=2):
     p = Path(cache_path)
+    allow_write(p)
     if p.exists():
         try:
             json.loads(p.read_text(encoding="utf-8"))
-            return  # looks fine
+            return
         except Exception:
-            pass  # rebuild
+            pass
 
     try:
-        import geoip2.database, geoip2.errors  # optional dependency
+        import geoip2.database  # optional
     except Exception:
         print("[plot] geoip2 not installed; pass an existing geo_cache.json or install geoip2.")
+        with open(p, "w", encoding="utf-8") as f: f.write("{}")
         return
-    city_mmdb = os.environ.get("GEOIP2_CITY_DB",
-                                 os.path.join(os.getcwd(), "GeoLite2-City_20250523", "GeoLite2-City.mmdb"))
-    asn_mmdb  = os.environ.get("GEOIP2_ASN_DB",
-                                 os.path.join(os.getcwd(), "GeoLite2-ASN_20250527", "GeoLite2-ASN.mmdb"))
+
+    city_mmdb = city_mmdb or os.environ.get("GEOIP2_CITY_DB")
+    asn_mmdb  = asn_mmdb  or os.environ.get("GEOIP2_ASN_DB")
     city_r = asn_r = None
     if city_mmdb and Path(city_mmdb).exists():
-        city_r = geoip2.database.Reader(city_mmdb)
-    else:
-        print(f'Missing {city_mmdb}')
+        city_r = geoip2.database.Reader(city_mmdb)  # type: ignore[name-defined]
     if asn_mmdb and Path(asn_mmdb).exists():
-        asn_r = geoip2.database.Reader(asn_mmdb)
-    else:
-        print(f'Missing {asn_mmdb}')
+        asn_r = geoip2.database.Reader(asn_mmdb)    # type: ignore[name-defined]
     if not (city_r or asn_r):
-        print("[plot] cannot build geo_cache.json.")
-        return
+        with open(p,"w",encoding="utf-8") as f: f.write("{}")
+        print("[plot] cannot build geo_cache.json (missing MMDBs)."); return
 
     ips = _collect_ips_from_db(db_path, since_hours=since_hours)
     if not ips:
-        print("[plot] No IPs to geolocate from DB.")
-        return
+        with open(p,"w",encoding="utf-8") as f: f.write("{}")
+        print("[plot] No IPs to geolocate from DB."); return
 
     cache = {}
     filled = 0
@@ -609,7 +736,8 @@ def build_geo_cache_if_needed(db_path, cache_path="geo_cache.json", city_mmdb=DE
             filled += 1
 
     tmp = p.with_suffix(".tmp.json")
-    tmp.write_text(json.dumps(cache), encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(cache))
     tmp.replace(p)
     try:
         if city_r: city_r.close()
@@ -657,6 +785,12 @@ def _ensure_folium():
     except Exception as e:
         raise RuntimeError("folium not installed (pip install folium)") from e
 
+def _write_map_refresh(html_path: Path, refresh_sec: int):
+    allow_write(html_path)
+    html = html_path.read_text(encoding="utf-8")
+    html = html.replace("<head>", f"<head>\n<meta http-equiv=\"refresh\" content=\"{int(refresh_sec)}\">")
+    html_path.write_text(html, encoding="utf-8")
+
 def plot_live_opacity(db_path, cache_path, output,
                       half_life_min=15, cutoff_hours=24,
                       min_opacity=0.06, max_opacity=0.98,
@@ -689,8 +823,6 @@ def plot_live_opacity(db_path, cache_path, output,
     if not points:
         raise RuntimeError("No points within cutoff; build/refresh geo cache or widen cutoff.")
 
-    avg_lat = sum(p["lat"] for p in points)/len(points)
-    avg_lon = sum(p["lon"] for p in points)/len(points)
     m = folium.Map(location=[17, 23], zoom_start=2.75, tiles="CartoDB dark_matter")
     plugins.Fullscreen(position="topright").add_to(m)
     plugins.MiniMap(toggle_display=True).add_to(m)
@@ -714,7 +846,6 @@ def plot_live_opacity(db_path, cache_path, output,
             ).add_to(layer)
     layer.add_to(m)
 
-    # footer: recent event rates
     con = sqlite3.connect(db_path)
     gp5 = con.execute("SELECT COUNT(*) FROM getpeers WHERE ts >= strftime('%s','now')-300").fetchone()[0]
     an5 = con.execute("SELECT COUNT(*) FROM announces WHERE ts >= strftime('%s','now')-300").fetchone()[0]
@@ -731,11 +862,10 @@ def plot_live_opacity(db_path, cache_path, output,
     m.get_root().html.add_child(folium.Element(footer))
     folium.LayerControl(collapsed=False).add_to(m)
 
-    out = Path(output); m.save(str(out))
-    html = out.read_text(encoding="utf-8")
-    html = html.replace("<head>", f"<head>\n<meta http-equiv=\"refresh\" content=\"{int(refresh_sec)}\">")
-    out.write_text(html, encoding="utf-8")
-    print(f"[plot] wrote {out.resolve()} ({len(points)} points)")
+    out = Path(output); allow_write(out)
+    m.save(str(out))
+    _write_map_refresh(out, refresh_sec)
+    print(f"[plot] wrote {out.resolve()}")
 
 def plot_constellation(db_path, cache_path, output,
                        half_life_min=15, cutoff_hours=24,
@@ -766,6 +896,7 @@ def plot_constellation(db_path, cache_path, output,
                     "opacity":opacity,"radius":radius,"fresh":fresh,"score":s})
     if not pts:
         raise RuntimeError("No points within cutoff.")
+
     # grid thinning
     lat_min, lat_max = min(p["lat"] for p in pts), max(p["lat"] for p in pts)
     lon_min, lon_max = min(p["lon"] for p in pts), max(p["lon"] for p in pts)
@@ -788,8 +919,6 @@ def plot_constellation(db_path, cache_path, output,
             thin.extend(items[:cell_top])
         pts = thin
 
-    avg_lat = sum(p["lat"] for p in pts)/len(pts)
-    avg_lon = sum(p["lon"] for p in pts)/len(pts)
     m = folium.Map(location=[17, 23], zoom_start=3, tiles="CartoDB dark_matter")
     plugins.Fullscreen(position="topright").add_to(m)
     plugins.MiniMap(toggle_display=True).add_to(m)
@@ -809,23 +938,27 @@ def plot_constellation(db_path, cache_path, output,
     layer.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
 
-    out = Path(output); m.save(str(out))
-    html = out.read_text(encoding="utf-8")
-    html = html.replace("<head>", f"<head>\n<meta http-equiv=\"refresh\" content=\"{int(refresh_sec)}\">")
-    out.write_text(html, encoding="utf-8")
-    print(f"[plot] wrote {out.resolve()} ({len(pts)} points)")
+    out = Path(output); allow_write(out)
+    m.save(str(out))
+    _write_map_refresh(out, refresh_sec)
+    print(f"[plot] wrote {out.resolve()}")
 
-# ---------------- CLI ----------------
-
+# -------------------- CLI --------------------
 def main():
     ap = argparse.ArgumentParser(description="Inspect and resolve torrents from dht_observatory.db")
     ap.add_argument("--db", default=DEFAULT_DB, help="Path to dht_observatory.db")
     ap.add_argument("--limit", type=int, default=50, help="Max rows to show/export per section")
     sub = ap.add_subparsers(dest="cmd")
 
-    
     sp_sum = sub.add_parser("summary", help="Show overall counts and recent activity (optionally plot)")
-    sp_sum.add_argument("--plot", choices=["live","constellation"], help="Generate an HTML map and exit after summary")
+    sp_sum.add_argument("--lookup", action="store_true",
+                        help="Best-effort fetch names for recent announces without writing to DB")
+    sp_sum.add_argument("--name-timeout", type=float, default=6.0,
+                        help="Seconds to wait per best-effort name lookup")
+    sp_sum.add_argument("--cache-names", action="store_true",
+                        help="If set with --lookup, upsert looked-up metadata into the DB")
+    sp_sum.add_argument("--plot", choices=["live","constellation"],
+                        help="Generate an HTML map and exit after summary")
     sp_sum.add_argument("--plot-output", default="bt_map.html")
     sp_sum.add_argument("--geo-cache", default="geo_cache.json")
     sp_sum.add_argument("--city-mmdb", help="GeoLite2-City.mmdb (optional; used to build geo_cache.json if missing)")
@@ -851,19 +984,27 @@ def main():
     ex.add_argument("--out", required=True)
 
     rp = sub.add_parser("resolve", help="Resolve metadata (BEP-9) for announces; runs out-of-process")
-    rp.add_argument("--batch", type=int, default=100, help="Rows per pass")
+    rp.add_argument("--batch", type=int, default=1, help="Rows per pass")
     rp.add_argument("--concurrency", type=int, default=24, help="Concurrent resolves")
     rp.add_argument("--timeout", type=float, default=8.0, help="Per-peer timeout (s)")
     rp.add_argument("--per-ih", type=int, default=8, help="Max peers tried per infohash (after announce)")
     rp.add_argument("--dht-peers", type=int, default=30, help="Peers to fetch via DHT get_peers")
-    rp.add_argument("--since-minutes", type=int, default=None, help="Only resolve announces newer than this many minutes")
+    rp.add_argument("--since-minutes", type=int, default=120*60, help="Only resolve announces newer than this many minutes")
     rp.add_argument("--loop", action="store_true", help="Keep resolving as new announces arrive")
 
     args = ap.parse_args()
+
+    # prime write whitelist for expected outputs
+    allow_write(Path(args.db))
+    if hasattr(args, "geo_cache"):  allow_write(Path(args.geo_cache))
+    if hasattr(args, "plot_output"): allow_write(Path(args.plot_output))
+
     con = open_db(args.db)
 
     if args.cmd in (None, "summary"):
-        cmd_summary(con, args.limit)
+        if args.lookup and _GETMETA is None:
+            print("[!] --lookup requested but dht_crawler_v4.get_metadata_from_infohash not importable.", file=sys.stderr)
+        cmd_summary(con, args.limit, bool(args.lookup), float(getattr(args, "name_timeout", 6.0)), bool(getattr(args, "cache_names", False)))
         if getattr(args, "plot", None):
             build_geo_cache_if_needed(
                 db_path=args.db,
@@ -875,15 +1016,20 @@ def main():
             try:
                 if args.plot == "live":
                     plot_live_opacity(
-                        db_path=args.db, cache_path=getattr(args, "geo_cache", "geo_cache.json"), output=getattr(args, "plot_output", "bt_map.html"),
-                        half_life_min=getattr(args, "half_life_min", 15.0), cutoff_hours=getattr(args, "cutoff_hours", 24.0),
+                        db_path=args.db, cache_path=getattr(args, "geo_cache", "geo_cache.json"),
+                        output=getattr(args, "plot_output", "bt_map.html"),
+                        half_life_min=getattr(args, "half_life_min", 15.0),
+                        cutoff_hours=getattr(args, "cutoff_hours", 24.0),
                         refresh_sec=getattr(args, "refresh_sec", 20)
                     )
                 else:
                     plot_constellation(
-                        db_path=args.db, cache_path=getattr(args, "geo_cache", "geo_cache.json"), output=getattr(args, "plot_output", "bt_map.html"),
-                        half_life_min=getattr(args, "half_life_min", 15.0), cutoff_hours=getattr(args, "cutoff_hours", 24.0),
-                        target_points=getattr(args, "target_points", 3500), cell_top=getattr(args, "cell_top", 3),
+                        db_path=args.db, cache_path=getattr(args, "geo_cache", "geo_cache.json"),
+                        output=getattr(args, "plot_output", "bt_map.html"),
+                        half_life_min=getattr(args, "half_life_min", 15.0),
+                        cutoff_hours=getattr(args, "cutoff_hours", 24.0),
+                        target_points=getattr(args, "target_points", 3500),
+                        cell_top=getattr(args, "cell_top", 3),
                         refresh_sec=getattr(args, "refresh_sec", 20)
                     )
             except Exception as e:
@@ -918,3 +1064,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
