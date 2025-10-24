@@ -19,7 +19,7 @@ It peers into the fabric of peer-to-peer communication—constructing an evolvin
 
 crawler.py – Recursive node discovery using Kademlia logic.
 
-visualizer.py – Transforms logs into nodes  overlaid onto a real word map, revealing physical topology. 
+plotter_opacity_live.py – Transforms logs into nodes  overlaid onto a real word map, revealing physical topology. 
 
 
 # :file_folder: Data Outputs
@@ -47,6 +47,14 @@ Will make a script for unix based systems but for now you can run:
 ```
 python resolver.py summary --plot live --plot-output bt_map_opacity_live.html --geo-cache geo_cache.json --half-life-min 15 --cutoff-hours 6 --refresh-sec 10
 ```
+If you don't want the live maps you can just run the resolver/crawler in background and observe info with flask dashboard. 
+```commandline
+python resolver.py top --loop
+```
+with 
+```commandline
+python dht_crawler_v4.py
+```
 
 # :compass: Use Cases:
 * :gear: Network protocol research
@@ -54,6 +62,19 @@ python resolver.py summary --plot live --plot-output bt_map_opacity_live.html --
 * :closed_lock_with_key: Surveillance infrastructure awareness
 * :dna: Evolution of node clusters over time
 * :performing_arts: Analyzing potential misuse of DHT as a dark web mirror
+
+# Flask frontend
+Visualize progress/data being seen on network using the dashboard with: 
+```commandline
+# Basic usage
+python dashboard.py
+
+# Custom database path
+python dashboard.py --db /path/to/dht_observatory.db
+
+# Custom port and make accessible on network
+python dashboard.py --host 0.0.0.0 --port 8080
+```
 
 
 # :brain: Philosophy
