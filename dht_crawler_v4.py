@@ -474,6 +474,8 @@ def get_metadata_from_infohash(infohash_hex, timeout=30):
     for f in torinfo.files():
         files.append({"path": f.path, "size": f.size})
     result = {"name": torinfo.name(), "files": files, "total": torinfo.total_size()}
+    if os.path.isfile(torinfo.name()):
+        os.remove(result['name'])
     return result
 
 
