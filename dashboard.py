@@ -205,6 +205,72 @@ def api_getpeers():
 		return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/peer-tree')
+def api_peer_tree():
+	"""Get peer tree with their announces"""
+	try:
+		limit = int(request.args.get('limit', 50))
+		con = get_db()
+		
+		# Get peers with announce counts
+		peers = con.execute("""
+            SELECT
+                ip || ':' || port as peer,
+                COUNT(*) as total_announces,
+                SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) as resolved,
+                SUM(CASE WHEN status = 'pending' OR status = 'working' THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as failed,
+                MAX(ts) as last_seen
+            FROM announces
+            GROUP BY ip, port
+            ORDER BY last_seen DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+		
+		results = []
+		for peer in peers:
+			peer_addr = peer["peer"]
+			ip, port = peer_addr.split(':')
+			
+			# Get announces for this peer
+			announces = con.execute("""
+                SELECT
+                    a.info_hash,
+                    a.status,
+                    a.ts,
+                    m.name
+                FROM announces a
+                LEFT JOIN metadata m ON m.info_hash = a.info_hash
+                WHERE a.ip = ? AND a.port = ?
+                ORDER BY a.ts DESC
+                LIMIT 20
+            """, (ip, int(port))).fetchall()
+			
+			announce_list = []
+			for ann in announces:
+				announce_list.append({
+					"info_hash": ann["info_hash"],
+					"status": ann["status"],
+					"name": ann["name"],
+					"ago": ago(ann["ts"])
+				})
+			
+			results.append({
+				"peer": peer_addr,
+				"total": peer["total_announces"],
+				"resolved": peer["resolved"],
+				"pending": peer["pending"],
+				"failed": peer["failed"],
+				"last_seen": ago(peer["last_seen"]),
+				"announces": announce_list
+			})
+		
+		con.close()
+		return jsonify(results)
+	except Exception as e:
+		return jsonify({"error": str(e)}), 500
+
+
 # HTML Template
 TEMPLATE = '''<!DOCTYPE html>
 <html lang="en">
@@ -223,13 +289,14 @@ TEMPLATE = '''<!DOCTYPE html>
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: #0a0e27;
             color: #e4e4e7;
-            overflow: hidden;
+            overflow-y: auto;
+            overflow-x: hidden;
         }
 
         .container {
             display: flex;
             flex-direction: column;
-            height: 100vh;
+            min-height: 100vh;
             padding: 20px;
             gap: 20px;
         }
@@ -296,8 +363,12 @@ TEMPLATE = '''<!DOCTYPE html>
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 20px;
-            flex: 1;
-            overflow: hidden;
+            height: 600px;
+        }
+
+        .peer-tree-section {
+            margin-top: 0;
+            margin-bottom: 40px;
         }
 
         .panel {
@@ -429,6 +500,131 @@ TEMPLATE = '''<!DOCTYPE html>
             padding: 20px;
         }
 
+        .peer-node {
+            background: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            overflow: hidden;
+            transition: all 0.2s;
+        }
+
+        .peer-node:hover {
+            border-color: #667eea;
+        }
+
+        .peer-header {
+            padding: 12px 15px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            user-select: none;
+            background: linear-gradient(90deg, #1e293b 0%, #0f172a 100%);
+        }
+
+        .peer-header:hover {
+            background: linear-gradient(90deg, #334155 0%, #1e293b 100%);
+        }
+
+        .peer-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .peer-ip {
+            font-family: 'Courier New', monospace;
+            color: #818cf8;
+            font-weight: bold;
+        }
+
+        .peer-stats {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            font-size: 0.8rem;
+        }
+
+        .peer-badge {
+            padding: 2px 6px;
+            border-radius: 8px;
+            font-size: 0.7rem;
+            font-weight: bold;
+        }
+
+        .peer-badge.resolved {
+            background: #10b981;
+            color: #fff;
+        }
+
+        .peer-badge.pending {
+            background: #fbbf24;
+            color: #000;
+        }
+
+        .peer-badge.failed {
+            background: #ef4444;
+            color: #fff;
+        }
+
+        .expand-icon {
+            transition: transform 0.3s;
+            color: #94a3b8;
+        }
+
+        .expand-icon.expanded {
+            transform: rotate(90deg);
+        }
+
+        .peer-announces {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out;
+        }
+
+        .peer-announces.expanded {
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        .announce-item {
+            padding: 10px 15px;
+            border-top: 1px solid #1e293b;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background 0.2s;
+        }
+
+        .announce-item:hover {
+            background: #1e293b;
+        }
+
+        .announce-hash {
+            font-family: 'Courier New', monospace;
+            color: #94a3b8;
+            font-size: 0.75rem;
+            flex: 0 0 180px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .announce-name {
+            flex: 1;
+            color: #f1f5f9;
+            font-size: 0.85rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            margin: 0 10px;
+        }
+
+        .announce-name.unresolved {
+            color: #64748b;
+            font-style: italic;
+        }
+
         @media (max-width: 1024px) {
             .content-grid {
                 grid-template-columns: 1fr;
@@ -477,6 +673,15 @@ TEMPLATE = '''<!DOCTYPE html>
                 </div>
             </div>
         </div>
+
+        <div class="peer-tree-section">
+            <div class="panel">
+                <h2>🌳 Peer Announce Tree</h2>
+                <div class="list" id="peer-tree">
+                    <div class="loading">Loading peer data...</div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -503,7 +708,7 @@ TEMPLATE = '''<!DOCTYPE html>
 
         async function updateResolved() {
             try {
-                const response = await fetch('/api/resolved?limit=50');
+                const response = await fetch('/api/resolved?limit=15');
                 const data = await response.json();
                 const container = document.getElementById('resolved-list');
 
@@ -536,7 +741,7 @@ TEMPLATE = '''<!DOCTYPE html>
 
         async function updateAnnounces() {
             try {
-                const response = await fetch('/api/announces?limit=50');
+                const response = await fetch('/api/announces?limit=15');
                 const data = await response.json();
                 const container = document.getElementById('announces-list');
 
@@ -545,13 +750,7 @@ TEMPLATE = '''<!DOCTYPE html>
                     return;
                 }
 
-                // Only update if we have new items
-                const newestTimestamp = data[0]?.timestamp || 0;
-                if (newestTimestamp <= lastAnnounceTimestamp && container.children.length > 0) {
-                    return;
-                }
-                lastAnnounceTimestamp = newestTimestamp;
-
+                // Always update to show status changes
                 container.innerHTML = data.map(item => `
                     <div class="list-item">
                         <div class="hash">${item.info_hash}</div>
@@ -568,15 +767,73 @@ TEMPLATE = '''<!DOCTYPE html>
             }
         }
 
+        async function updatePeerTree() {
+            try {
+                const response = await fetch('/api/peer-tree?limit=30');
+                const data = await response.json();
+                const container = document.getElementById('peer-tree');
+
+                if (data.length === 0) {
+                    container.innerHTML = '<div class="loading">No peer data yet...</div>';
+                    return;
+                }
+
+                container.innerHTML = data.map(peer => {
+                    const announcesHtml = peer.announces.map(ann => `
+                        <div class="announce-item">
+                            <div class="announce-hash" title="${ann.info_hash}">${ann.info_hash.substring(0, 16)}...</div>
+                            <div class="announce-name ${ann.name ? '' : 'unresolved'}" title="${ann.name || 'Not resolved'}">
+                                ${ann.name || '(unresolved)'}
+                            </div>
+                            <span class="status-badge status-${ann.status}">${ann.status}</span>
+                        </div>
+                    `).join('');
+
+                    return `
+                        <div class="peer-node">
+                            <div class="peer-header" onclick="togglePeer(this)">
+                                <div class="peer-info">
+                                    <span class="expand-icon">▶</span>
+                                    <span class="peer-ip">${peer.peer}</span>
+                                    <span style="color: #64748b; font-size: 0.8rem;">${peer.last_seen} ago</span>
+                                </div>
+                                <div class="peer-stats">
+                                    <span class="peer-badge resolved">${peer.resolved} ✓</span>
+                                    <span class="peer-badge pending">${peer.pending} ⋯</span>
+                                    <span class="peer-badge failed">${peer.failed} ✗</span>
+                                    <span style="color: #94a3b8; font-size: 0.85rem;">${peer.total} total</span>
+                                </div>
+                            </div>
+                            <div class="peer-announces">
+                                ${announcesHtml}
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (err) {
+                console.error('Peer tree update failed:', err);
+            }
+        }
+
+        function togglePeer(header) {
+            const icon = header.querySelector('.expand-icon');
+            const announces = header.parentElement.querySelector('.peer-announces');
+
+            icon.classList.toggle('expanded');
+            announces.classList.toggle('expanded');
+        }
+
         // Initial load
         updateStats();
         updateResolved();
         updateAnnounces();
+        updatePeerTree();
 
         // Update intervals
         setInterval(updateStats, 5000);      // Stats every 5s
         setInterval(updateResolved, 3000);   // Resolved every 3s
         setInterval(updateAnnounces, 2000);  // Announces every 2s
+        setInterval(updatePeerTree, 5000);   // Peer tree every 5s
     </script>
 </body>
 </html>
