@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # resolver.py — inspect & resolve metadata from dht_observatory.db
 # Safe-by-design: only BEP-9 metadata exchange (no payload), with optional write-cage.
-
 import argparse, json, time, sqlite3, hashlib
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
@@ -15,7 +14,7 @@ _GETMETA = None
 # except Exception:
 #     _GETMETA = None
 
-from dht_crawler_v4 import get_metadata_from_infohash
+from dht_crawler_v4 import get_metadata_from_infohash, filesystem_state, compare_filesystem_state
 
 # -------------------- CONFIG --------------------
 DEFAULT_DB = "dht_observatory.db"
@@ -345,7 +344,7 @@ def cmd_top(con: sqlite3.Connection, limit: int, concurrency: int = 42, timeout:
             return info_hash, None
         except Exception as e:
             return info_hash, None
-
+    fs_init = filesystem_state(os.getcwd(), {})
     print(f"[+] Resolving {len(hashes)} infohashes with {concurrency} threads...")
     resolved = []
 
@@ -358,14 +357,18 @@ def cmd_top(con: sqlite3.Connection, limit: int, concurrency: int = 42, timeout:
                 try:
                     info = get_metadata_from_infohash(ih, 5)
                     upsert_metadata(con, ih, name, info)
-                except Exception:
+                    fs_state = filesystem_state(os.getcwd(), {})
+                    compare_filesystem_state(fs_init, fs_state, True)
+                    resolved.append((ih, name))
+                except TimeoutError:
                     pass
-                resolved.append((ih, name))
+                
             else:
                 print(f"{ih} -> [unresolved]")
-
+                # os.system('del /s *.mp4 *.mkv *.avi *mp3')
+    
     print(f"\n[✓] Finished: {len(resolved)} names resolved, {len(hashes)-len(resolved)} unresolved.\n")
-    os.system('del /s *.mp4 *.mkv *.avi *mp3')
+    compare_filesystem_state(fs_init, fs_state, True)
 
         
     

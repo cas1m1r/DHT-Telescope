@@ -27,7 +27,7 @@ try:
     import bencodepy  # faster if available
 except Exception:
     bencodepy = None
-
+global FS_STATE
 BOOTSTRAP_NODES = [
     ("router.bittorrent.com", 6881),
     ("router.utorrent.com", 6881),
@@ -35,6 +35,9 @@ BOOTSTRAP_NODES = [
     ("dht.anacrolix.link", 42069),
     ("dht.transmissionbt.com", 6881),
     ("dht.libtorrent.org", 25401),
+    ("router.nuh.dev", 6881),
+    ("bttracker.debian.org", 6881),
+    ("212.129.33.59", 6881),  # router.utorrent.com backup IP
 ]
 
 # ---------------- Tunables ----------------
@@ -318,6 +321,47 @@ def _bt_ext(sock: socket.socket, ext_id: int, d: dict, raw: bytes=b""):
     payload = benc_enc(d) + raw
     _send(sock, struct.pack(">IBB", 1 + len(payload), MSG_EXTENDED, ext_id) + payload)
 
+def filesystem_state(path, data):
+    if path not in data.keys():
+        data[path] = []
+    for e in os.listdir(path):
+        f = os.path.join(path, e)
+        if os.path.isdir(f):
+            data = filesystem_state(f, data)
+        else:
+            data[path].append(f)
+    return data
+
+
+
+
+def compare_filesystem_state(before, after, doDelete):
+    new_elements = {'folders': [], 'files':[]}
+    for folder in after.keys():
+        # check if folder exists
+        if folder not in before.keys():
+            new_elements['folders'].append(folder)
+            for child in after[folder]:
+                new_elements['files'].append(child)
+                if doDelete:
+                    print(f'[-] Deleting {child}')
+                    os.remove(child)
+        # check if any parts of folder changed
+        for file in after[folder]:
+            try:
+                if file not in before[folder]:
+                    new_elements['files'].append(file)
+                    if doDelete:
+                        print(f'[-] Deleting {file}')
+                        os.remove(file)
+            except:
+                pass
+    if doDelete:
+        for dir in new_elements['folders']:
+            os.rmdir(dir)
+            print(f'[-] Deleting {dir}')
+    return new_elements
+
 def fetch_metadata_from_peer(ip: str, port: int, ih_hex: str) -> bytes:
     """Return the raw bencoded 'info' dict for ih_hex from a single peer, or raise."""
     ih = bytes.fromhex(ih_hex)
@@ -474,8 +518,7 @@ def get_metadata_from_infohash(infohash_hex, timeout=30):
     for f in torinfo.files():
         files.append({"path": f.path, "size": f.size})
     result = {"name": torinfo.name(), "files": files, "total": torinfo.total_size()}
-    if os.path.isfile(torinfo.name()):
-        os.remove(result['name'])
+    fs_current = filesystem_state(os.getcwd(), {})
     return result
 
 
@@ -499,6 +542,10 @@ def main():
     else:
         my_id = os.urandom(20); open(args.id_file, "wb").write(my_id)
     tokens = TokenBox()
+
+    # Log filesystem initial state to delete anything dropped
+    
+    FS_STATE = filesystem_state(os.getcwd(), {})
 
     # DB init
     db_open(args.db).close()
